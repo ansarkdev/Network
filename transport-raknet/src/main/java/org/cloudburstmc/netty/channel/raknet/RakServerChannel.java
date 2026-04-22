@@ -120,6 +120,10 @@ public class RakServerChannel extends ProxyChannel<DatagramChannel> implements S
         return this.childChannelMap.get(address);
     }
 
+    public int getChildChannelCount() {
+        return this.childChannelMap.size();
+    }
+
     private void onChildClosed(ChannelFuture channelFuture) {
         RakChildChannel channel = (RakChildChannel) channelFuture.channel();
         this.childChannelMap.remove(channel.remoteAddress());

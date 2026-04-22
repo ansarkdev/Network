@@ -154,7 +154,19 @@ public class RakServerOfflineHandler extends AdvancedChannelInboundHandler<Datag
         }
 
         // TODO: banned address check?
-        // TODO: max connections check?
+
+        // Bug 7 fix: enforce max connections limit before proceeding with handshake
+        int maxConnections = config.getMaxConnections();
+        if (maxConnections > 0) {
+            RakServerChannel serverChannel = (RakServerChannel) ctx.channel();
+            if (serverChannel.getChildChannelCount() >= maxConnections) {
+                if (log.isDebugEnabled()) {
+                    log.debug("[{}] Rejecting connection: max connections reached ({})", sender, maxConnections);
+                }
+                this.sendNoFreeConnections(ctx, packet, magicBuf, guid);
+                return;
+            }
+        }
 
         boolean sendCookie = config.getCookieMode() == RakServerCookieMode.ACTIVE;
 
@@ -261,6 +273,14 @@ public class RakServerOfflineHandler extends AdvancedChannelInboundHandler<Datag
     private void sendAlreadyConnected(ChannelHandlerContext ctx, DatagramPacket request, ByteBuf magicBuf, long guid) {
         ByteBuf buffer = ctx.alloc().ioBuffer(25, 25);
         buffer.writeByte(ID_ALREADY_CONNECTED);
+        buffer.writeBytes(magicBuf, magicBuf.readerIndex(), magicBuf.readableBytes());
+        buffer.writeLong(guid);
+        ctx.writeAndFlush(RakUtils.datagramReply(buffer, request));
+    }
+
+    private void sendNoFreeConnections(ChannelHandlerContext ctx, DatagramPacket request, ByteBuf magicBuf, long guid) {
+        ByteBuf buffer = ctx.alloc().ioBuffer(25, 25);
+        buffer.writeByte(ID_NO_FREE_INCOMING_CONNECTIONS);
         buffer.writeBytes(magicBuf, magicBuf.readerIndex(), magicBuf.readableBytes());
         buffer.writeLong(guid);
         ctx.writeAndFlush(RakUtils.datagramReply(buffer, request));

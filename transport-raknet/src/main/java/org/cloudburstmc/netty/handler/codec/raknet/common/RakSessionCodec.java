@@ -281,6 +281,10 @@ public class RakSessionCodec extends ChannelDuplexHandler {
         }
     }
 
+    private static final int MAX_SEQUENCE_INDEX_GAP = 1024;
+    private static final int MAX_RELIABILITY_INDEX_GAP = 1024;
+    private static final int MAX_ORDERING_HEAP_SIZE = 512;
+
     private void handleDatagram(ChannelHandlerContext ctx, RakDatagramPacket packet) {
         this.touch();
         RakChannelMetrics metrics = this.getMetrics();
@@ -291,11 +295,22 @@ public class RakSessionCodec extends ChannelDuplexHandler {
         this.slidingWindow.onPacketReceived(packet.getSendTime());
 
         int prevSequenceIndex = this.datagramReadIndex;
+        int missedDatagrams = packet.getSequenceIndex() - prevSequenceIndex;
+
+        // Bug 1 fix: reject datagrams with absurdly large sequence index gaps
+        if (missedDatagrams > MAX_SEQUENCE_INDEX_GAP) {
+            if (log.isDebugEnabled()) {
+                log.debug("Rejecting datagram from {} with excessive sequence gap: {} (current: {})",
+                        this.getRemoteAddress(), packet.getSequenceIndex(), prevSequenceIndex);
+            }
+            this.disconnect(RakDisconnectReason.BAD_PACKET);
+            return;
+        }
+
         if (prevSequenceIndex <= packet.getSequenceIndex()) {
             this.datagramReadIndex = packet.getSequenceIndex() + 1;
         }
 
-        int missedDatagrams = packet.getSequenceIndex() - prevSequenceIndex;
         if (missedDatagrams > 0) {
             this.outgoingNaks.offer(new IntRange(packet.getSequenceIndex() - missedDatagrams, packet.getSequenceIndex() - 1));
         }
@@ -305,6 +320,17 @@ public class RakSessionCodec extends ChannelDuplexHandler {
         for (final EncapsulatedPacket encapsulated : packet.getPackets()) {
             if (encapsulated.getReliability().isReliable()) {
                 int missed = encapsulated.getReliabilityIndex() - this.reliabilityReadIndex;
+
+                // Bug 2 fix: reject packets with absurdly large reliability index gaps
+                if (missed > MAX_RELIABILITY_INDEX_GAP) {
+                    if (log.isDebugEnabled()) {
+                        log.debug("Rejecting packet from {} with excessive reliability index gap: {} (current: {})",
+                                this.getRemoteAddress(), encapsulated.getReliabilityIndex(), this.reliabilityReadIndex);
+                    }
+                    this.disconnect(RakDisconnectReason.BAD_PACKET);
+                    return;
+                }
+
                 if (missed > 0) {
                     if (missed < this.reliableDatagramQueue.size()) {
                         if (this.reliableDatagramQueue.get(missed)) {
@@ -369,27 +395,49 @@ public class RakSessionCodec extends ChannelDuplexHandler {
     }
 
     private void onOrderedReceived(ChannelHandlerContext ctx, EncapsulatedPacket packet) {
-        FastBinaryMinHeap<EncapsulatedPacket> binaryHeap = this.orderingHeaps[packet.getOrderingChannel()];
-        if (this.orderReadIndex[packet.getOrderingChannel()] < packet.getOrderingIndex()) {
+        // Bug 5 fix: validate ordering channel to prevent ArrayIndexOutOfBoundsException
+        int channel = packet.getOrderingChannel();
+        if (channel < 0 || channel >= this.orderingHeaps.length) {
+            if (log.isDebugEnabled()) {
+                log.debug("Rejecting packet from {} with invalid ordering channel: {} (max: {})",
+                        this.getRemoteAddress(), channel, this.orderingHeaps.length - 1);
+            }
+            this.disconnect(RakDisconnectReason.BAD_PACKET);
+            return;
+        }
+
+        FastBinaryMinHeap<EncapsulatedPacket> binaryHeap = this.orderingHeaps[channel];
+
+        // Bug 6 fix: cap ordering heap size per channel to prevent unbounded memory growth
+        if (binaryHeap.size() >= MAX_ORDERING_HEAP_SIZE) {
+            if (log.isDebugEnabled()) {
+                log.debug("Ordering heap overflow for channel {} from {} (size: {}), disconnecting",
+                        channel, this.getRemoteAddress(), binaryHeap.size());
+            }
+            this.disconnect(RakDisconnectReason.BAD_PACKET);
+            return;
+        }
+
+        if (this.orderReadIndex[channel] < packet.getOrderingIndex()) {
             // Not next in line so add to queue.
             binaryHeap.insert(packet.getOrderingIndex(), packet.retain());
             return;
-        } else if (this.orderReadIndex[packet.getOrderingChannel()] > packet.getOrderingIndex()) {
+        } else if (this.orderReadIndex[channel] > packet.getOrderingIndex()) {
             // We already have this
             return;
         }
-        this.orderReadIndex[packet.getOrderingChannel()]++;
+        this.orderReadIndex[channel]++;
 
         // Can be handled
         ctx.fireChannelRead(packet.retain());
 
         EncapsulatedPacket queuedPacket;
         while ((queuedPacket = binaryHeap.peek()) != null) {
-            if (queuedPacket.getOrderingIndex() == this.orderReadIndex[packet.getOrderingChannel()]) {
+            if (queuedPacket.getOrderingIndex() == this.orderReadIndex[channel]) {
                 try {
                     // We got the expected packet
                     binaryHeap.remove();
-                    this.orderReadIndex[packet.getOrderingChannel()]++;
+                    this.orderReadIndex[channel]++;
                     ctx.fireChannelRead(queuedPacket.retain());
                 } finally {
                     queuedPacket.release();
@@ -401,12 +449,37 @@ public class RakSessionCodec extends ChannelDuplexHandler {
         }
     }
 
+    private static final int MAX_ACTIVE_SPLIT_HELPERS = 128;
+    private int activeSplitHelpers = 0;
+
     private EncapsulatedPacket getReassembledPacket(EncapsulatedPacket splitPacket, ByteBufAllocator alloc) {
         this.checkForClosed();
 
         SplitPacketHelper helper = this.splitPackets.get(splitPacket.getPartId());
         if (helper == null) {
-            this.splitPackets.set(splitPacket.getPartId(), helper = new SplitPacketHelper(splitPacket.getPartCount()));
+            // Bug 4 fix: limit concurrent split packet helpers to prevent memory exhaustion
+            if (this.activeSplitHelpers >= MAX_ACTIVE_SPLIT_HELPERS) {
+                // Expire oldest helpers to make room
+                boolean freed = false;
+                for (SplitPacketHelper existing : this.splitPackets) {
+                    if (existing != null && existing.expired()) {
+                        this.splitPackets.remove(splitPacket.getPartId(), existing);
+                        existing.release();
+                        this.activeSplitHelpers--;
+                        freed = true;
+                    }
+                }
+                if (!freed) {
+                    if (log.isDebugEnabled()) {
+                        log.debug("Too many active split helpers ({}) from {}, dropping split packet",
+                                this.activeSplitHelpers, this.getRemoteAddress());
+                    }
+                    return null;
+                }
+            }
+            helper = new SplitPacketHelper(splitPacket.getPartCount());
+            this.splitPackets.set(splitPacket.getPartId(), helper);
+            this.activeSplitHelpers++;
         }
 
         // Try reassembling the packet.
@@ -414,6 +487,7 @@ public class RakSessionCodec extends ChannelDuplexHandler {
         if (result != null) {
             // Packet reassembled. Remove the helper
             this.splitPackets.remove(splitPacket.getPartId(), helper);
+            this.activeSplitHelpers--;
         }
 
         return result;
@@ -516,6 +590,8 @@ public class RakSessionCodec extends ChannelDuplexHandler {
         }
     }
 
+    private static final int MAX_DRAIN_PER_FLUSH = 4096;
+
     private void handleIncomingAcknowledge(ChannelHandlerContext ctx, long curTime, Queue<IntRange> queue, boolean nack) {
         if (queue.isEmpty()) {
             return;
@@ -525,8 +601,18 @@ public class RakSessionCodec extends ChannelDuplexHandler {
 //            this.slidingWindow.onNak();
 //        }
 
+        int processed = 0;
         IntRange range;
         while ((range = queue.poll()) != null) {
+            // Bug 3b fix: cap total iterations per flush to prevent drain loop saturation
+            if (++processed > MAX_DRAIN_PER_FLUSH) {
+                queue.clear();
+                if (log.isDebugEnabled()) {
+                    log.debug("ACK/NACK drain limit reached for {}, clearing remaining queue", this.getRemoteAddress());
+                }
+                break;
+            }
+
             if (range.end < range.start || range.end >= this.datagramWriteIndex) {
                 if (log.isDebugEnabled()) {
                     log.debug("Received {} with out-of-range indices [{}, {}] from {} (write index: {})",

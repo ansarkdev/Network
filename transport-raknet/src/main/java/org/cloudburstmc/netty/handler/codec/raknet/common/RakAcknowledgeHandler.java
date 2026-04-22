@@ -34,6 +34,10 @@ public class RakAcknowledgeHandler extends SimpleChannelInboundHandler<ByteBuf> 
     private static final InternalLogger log = InternalLoggerFactory.getInstance(RakAcknowledgeHandler.class);
     public static final String NAME = "rak-acknowledge-handler";
 
+    private static final int MAX_ACK_ENTRIES = 512;
+    private static final int MAX_ACK_RANGE_WIDTH = 8192;
+    private static final int MAX_QUEUE_SIZE = 4096;
+
     private final RakSessionCodec sessionCodec;
 
     public RakAcknowledgeHandler(RakSessionCodec sessionCodec) {
@@ -60,23 +64,54 @@ public class RakAcknowledgeHandler extends SimpleChannelInboundHandler<ByteBuf> 
         boolean nack = (buffer.readByte() & FLAG_NACK) != 0;
         int entriesCount = buffer.readUnsignedShort();
 
+        // Bug 3 fix: reject packets with excessive entry counts
+        if (entriesCount > MAX_ACK_ENTRIES) {
+            if (log.isDebugEnabled()) {
+                log.debug("{} sent {} with excessive entries count: {}",
+                        sessionCodec.getChannel().remoteAddress(), nack ? "NACK" : "ACK", entriesCount);
+            }
+            this.sessionCodec.disconnect(RakDisconnectReason.BAD_PACKET);
+            return;
+        }
+
         Queue<IntRange> queue = this.sessionCodec.getAcknowledgeQueue(nack);
+
+        // Bug 3b fix: reject if queue is already too large (drain loop saturation)
+        if (queue.size() >= MAX_QUEUE_SIZE) {
+            if (log.isDebugEnabled()) {
+                log.debug("{} ACK/NACK queue overflow (size: {}), disconnecting",
+                        sessionCodec.getChannel().remoteAddress(), queue.size());
+            }
+            this.sessionCodec.disconnect(RakDisconnectReason.BAD_PACKET);
+            return;
+        }
+
         for (int i = 0; i < entriesCount; i++) {
             boolean singleton = buffer.readBoolean();
             int start = buffer.readUnsignedMediumLE();
             // We don't need the upper limit if it's a singleton
             int end = singleton ? start : buffer.readUnsignedMediumLE();
 
-            if (start <= end) {
-                queue.offer(new IntRange(start, end));
-                continue;
+            if (start > end) {
+                if (log.isTraceEnabled()) {
+                    log.trace("{} sent an IntRange with a start value {} greater than an end value of {}", sessionCodec.getChannel().remoteAddress(), start, end);
+                }
+                this.sessionCodec.disconnect(RakDisconnectReason.BAD_PACKET);
+                return;
             }
 
-            if (log.isTraceEnabled()) {
-                log.trace("{} sent an IntRange with a start value {} greater than an end value of {}", sessionCodec.getChannel().remoteAddress(), start, end);
+            // Bug 3 fix: reject ranges that are too wide (prevents inner loop explosion)
+            if ((end - start) > MAX_ACK_RANGE_WIDTH) {
+                if (log.isDebugEnabled()) {
+                    log.debug("{} sent {} with excessive range width: [{}, {}] (width: {})",
+                            sessionCodec.getChannel().remoteAddress(), nack ? "NACK" : "ACK",
+                            start, end, end - start);
+                }
+                this.sessionCodec.disconnect(RakDisconnectReason.BAD_PACKET);
+                return;
             }
-            this.sessionCodec.disconnect(RakDisconnectReason.BAD_PACKET);
-            return;
+
+            queue.offer(new IntRange(start, end));
         }
 
         RakChannelMetrics metrics = this.sessionCodec.getMetrics();
